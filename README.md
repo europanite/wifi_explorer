@@ -23,37 +23,6 @@ What it can do:
 - Reflect the samples on a live map in real time
 - Export the CSV file from the device
 
-## Project structure
-
-```text
-wifi-gps-logger-structured-expo/
-├── backend/
-│   └── app/
-│       └── README.md
-├── db/
-│   └── init/
-│       └── README.md
-├── frontend/
-│   ├── app/
-│   │   ├── components/
-│   │   ├── lib/
-│   │   ├── screens/
-│   │   ├── types/
-│   │   ├── App.tsx
-│   │   ├── app.json
-│   │   ├── babel.config.js
-│   │   ├── index.ts
-│   │   ├── metro.config.js
-│   │   ├── package.json
-│   │   └── tsconfig.json
-│   └── Dockerfile
-├── .dockerignore
-├── .env.example
-├── .gitignore
-├── docker-compose.yml
-└── README.md
-```
-
 ## Dependencies
 
 - Expo SDK 54
