@@ -1,0 +1,33 @@
+{
+  "name": "wifi-gps-logger-app",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "start:lan": "expo start --host lan",
+    "start:tunnel": "expo start --tunnel",
+    "typecheck": "tsc --noEmit",
+    "eas:login": "npx eas-cli@latest login",
+    "eas:whoami": "npx eas-cli@latest whoami",
+    "build:apk": "npx eas-cli@latest build --platform android --profile preview"
+  },
+  "dependencies": {
+    "@react-native-community/netinfo": "11.5.2",
+    "expo": "~54.0.0",
+    "expo-file-system": "~19.0.0",
+    "expo-location": "~19.0.0",
+    "expo-sharing": "~14.0.0",
+    "expo-status-bar": "~3.0.0",
+    "react": "19.1.0",
+    "react-native": "0.81.0",
+    "react-native-maps": "1.20.1",
+    "react-native-safe-area-context": "5.4.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.28.0",
+    "@types/react": "~19.1.10",
+    "babel-preset-expo": "~54.0.0",
+    "typescript": "~5.9.2"
+  }
+}

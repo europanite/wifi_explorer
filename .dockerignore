@@ -1,11 +1,11 @@
+.git
+.gitignore
 node_modules/
 frontend/app/node_modules/
 .expo/
 frontend/app/.expo/
-web-build/
 dist/
 build/
-.DS_Store
-.env
+web-build/
 frontend/app/android/
 frontend/app/ios/

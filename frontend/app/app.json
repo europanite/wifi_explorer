@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "wifi-gps-logger",
+    "slug": "wifi-gps-logger",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "android": {
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ],
+      "package": "com.europanite.wifigpslogger"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Allow the app to read your location while tracking the connected Wi-Fi signal."
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
