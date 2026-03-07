@@ -12,28 +12,39 @@ import {
 import NetInfo, { NetInfoState, NetInfoSubscription } from '@react-native-community/netinfo';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
-import MapView, { Circle, Marker, Polyline, Region } from 'react-native-maps';
+import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import SignalLegend from '../components/SignalLegend';
 import { appendSnapshot, createSessionFile } from '../lib/csv';
 import { circleRadius, strengthFillColor, strengthLabel, strengthStrokeColor } from '../lib/signal';
 import { SessionInfo, WifiSnapshot } from '../types/wifi';
 
-const DEFAULT_REGION: Region = {
+const DEFAULT_CENTER = {
   latitude: 35.681236,
   longitude: 139.767125,
-  latitudeDelta: 0.01,
-  longitudeDelta: 0.01,
-};
-
-const MAP_FOLLOW_DELTA = {
-  latitudeDelta: 0.0045,
-  longitudeDelta: 0.0045,
 };
 
 const WIFI_POLL_MS = 3000;
 const MIN_MOVE_METERS = 8;
 const MIN_STRENGTH_DELTA = 4;
 const MAX_POINTS_IN_MEMORY = 600;
+
+type WebMapPoint = {
+  id: string;
+  latitude: number;
+  longitude: number;
+  ssid: string | null;
+  strength: number | null;
+  fillColor: string;
+  strokeColor: string;
+  radius: number;
+};
+
+type WebMapPayload = {
+  center: { latitude: number; longitude: number };
+  samples: WebMapPoint[];
+  path: Array<[number, number]>;
+  current: WebMapPoint | null;
+};
 
 function makeSessionId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -72,16 +83,144 @@ function distanceMeters(a: Pick<WifiSnapshot, 'latitude' | 'longitude'>, b: Pick
   return 2 * earthRadius * Math.asin(Math.sqrt(h));
 }
 
+function makeLeafletHtml(): string {
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <style>
+      html, body, #map { height: 100%; margin: 0; padding: 0; background: #dbeafe; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+      .leaflet-container { background: #dbeafe; }
+      #status {
+        position: absolute;
+        z-index: 1000;
+        left: 12px;
+        right: 12px;
+        bottom: 12px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(15, 23, 42, 0.82);
+        color: white;
+        font-size: 12px;
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="status">Loading map…</div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+      (function () {
+        const statusEl = document.getElementById('status');
+        function setStatus(text) {
+          if (statusEl) statusEl.textContent = text;
+        }
+
+        if (!window.L) {
+          setStatus('Leaflet failed to load. Check network access.');
+          return;
+        }
+
+        const initialCenter = [35.681236, 139.767125];
+        const map = L.map('map', { zoomControl: true }).setView(initialCenter, 16);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        const circlesLayer = L.layerGroup().addTo(map);
+        const pathLayer = L.layerGroup().addTo(map);
+        const markerLayer = L.layerGroup().addTo(map);
+        let hasFitted = false;
+
+        window.__applyPayload = function (payload) {
+          try {
+            circlesLayer.clearLayers();
+            pathLayer.clearLayers();
+            markerLayer.clearLayers();
+
+            const points = Array.isArray(payload.samples) ? payload.samples : [];
+            const path = Array.isArray(payload.path) ? payload.path : [];
+            const current = payload.current || null;
+            const center = payload.center || { latitude: 35.681236, longitude: 139.767125 };
+
+            points.forEach(function (point) {
+              L.circleMarker([point.latitude, point.longitude], {
+                radius: point.radius,
+                color: point.strokeColor,
+                weight: 1,
+                fillColor: point.fillColor,
+                fillOpacity: 0.9,
+              })
+                .bindPopup((point.ssid || 'Current Wi-Fi') + '<br/>Strength: ' + (point.strength == null ? '—' : point.strength + '/100'))
+                .addTo(circlesLayer);
+            });
+
+            if (path.length >= 2) {
+              L.polyline(path, {
+                color: 'rgba(30, 41, 59, 0.85)',
+                weight: 3,
+              }).addTo(pathLayer);
+            }
+
+            if (current) {
+              L.marker([current.latitude, current.longitude])
+                .bindPopup((current.ssid || 'Current Wi-Fi') + '<br/>Strength: ' + (current.strength == null ? '—' : current.strength + '/100'))
+                .addTo(markerLayer);
+            }
+
+            if (!hasFitted) {
+              if (path.length >= 2) {
+                map.fitBounds(path, { padding: [30, 30] });
+                hasFitted = true;
+              } else {
+                map.setView([center.latitude, center.longitude], 16);
+              }
+            } else if (current) {
+              map.panTo([current.latitude, current.longitude], { animate: true, duration: 0.35 });
+            }
+
+            setStatus(points.length > 0 ? ('Samples: ' + points.length) : 'Waiting for samples…');
+          } catch (error) {
+            setStatus('Map render error: ' + (error && error.message ? error.message : String(error)));
+          }
+        };
+
+        document.addEventListener('message', function (event) {
+          try {
+            const payload = JSON.parse(event.data);
+            if (window.__applyPayload) window.__applyPayload(payload);
+          } catch (error) {
+            setStatus('Message parse error: ' + (error && error.message ? error.message : String(error)));
+          }
+        });
+
+        if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'ready' }));
+        }
+
+        setStatus('Map ready');
+      })();
+    </script>
+  </body>
+</html>`;
+}
+
 export default function HomeScreen() {
-  const mapRef = useRef<MapView | null>(null);
+  const webViewRef = useRef<WebView | null>(null);
   const locationSubRef = useRef<Location.LocationSubscription | null>(null);
   const netInfoSubRef = useRef<NetInfoSubscription | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const followRef = useRef(true);
   const sessionRef = useRef<SessionInfo | null>(null);
 
   const [isStarting, setIsStarting] = useState(false);
   const [isTracking, setIsTracking] = useState(false);
+  const [isMapReady, setIsMapReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState('Ready');
   const [session, setSession] = useState<SessionInfo | null>(null);
@@ -100,10 +239,43 @@ export default function HomeScreen() {
   }, [wifiState]);
 
   const currentSample = samples.length > 0 ? samples[samples.length - 1] : null;
-  const pathCoordinates = samples.map((sample) => ({
-    latitude: sample.latitude,
-    longitude: sample.longitude,
-  }));
+
+  const webMapPayload = useMemo<WebMapPayload>(() => {
+    const center = currentLocation
+      ? { latitude: currentLocation.latitude, longitude: currentLocation.longitude }
+      : currentSample
+        ? { latitude: currentSample.latitude, longitude: currentSample.longitude }
+        : DEFAULT_CENTER;
+
+    const mappedSamples = samples.map((sample) => ({
+      id: sample.id,
+      latitude: sample.latitude,
+      longitude: sample.longitude,
+      ssid: sample.ssid,
+      strength: sample.strength,
+      fillColor: strengthFillColor(sample.strength),
+      strokeColor: strengthStrokeColor(sample.strength),
+      radius: Math.max(5, Math.min(18, circleRadius(sample.strength) / 2.2)),
+    }));
+
+    return {
+      center,
+      samples: mappedSamples,
+      path: samples.map((sample) => [sample.latitude, sample.longitude] as [number, number]),
+      current: mappedSamples.length > 0 ? mappedSamples[mappedSamples.length - 1] : null,
+    };
+  }, [currentLocation, currentSample, samples]);
+
+  const mapHtml = useMemo(() => makeLeafletHtml(), []);
+
+  const syncMap = useCallback(() => {
+    if (!isMapReady || !webViewRef.current) {
+      return;
+    }
+
+    const payload = JSON.stringify(webMapPayload).replace(/</g, '\\u003c');
+    webViewRef.current.injectJavaScript(`window.__applyPayload(${payload}); true;`);
+  }, [isMapReady, webMapPayload]);
 
   const stopTracking = useCallback(() => {
     locationSubRef.current?.remove();
@@ -166,29 +338,20 @@ export default function HomeScreen() {
         }
       }
 
-      void appendSnapshot(activeSession.fileUri, snapshot).then(() => {
-        setRowsWritten((count) => count + 1);
-      }).catch((appendError: unknown) => {
-        const message = appendError instanceof Error ? appendError.message : 'Failed to append CSV data.';
-        setError(message);
-        setStatusText(message);
-      });
+      void appendSnapshot(activeSession.fileUri, snapshot)
+        .then(() => {
+          setRowsWritten((count) => count + 1);
+        })
+        .catch((appendError: unknown) => {
+          const message = appendError instanceof Error ? appendError.message : 'Failed to append CSV data.';
+          setError(message);
+          setStatusText(message);
+        });
 
       return [...previous, snapshot].slice(-MAX_POINTS_IN_MEMORY);
     });
 
     setCurrentLocation(coords);
-
-    if (followRef.current && mapRef.current) {
-      mapRef.current.animateToRegion(
-        {
-          latitude: coords.latitude,
-          longitude: coords.longitude,
-          ...MAP_FOLLOW_DELTA,
-        },
-        400,
-      );
-    }
   }, []);
 
   const handleLocationUpdate = useCallback(async (location: Location.LocationObject) => {
@@ -248,7 +411,7 @@ export default function HomeScreen() {
       );
 
       setIsTracking(true);
-      setStatusText('Tracking is running in Expo Go mode.');
+      setStatusText('Tracking is running.');
     } catch (startError: unknown) {
       stopTracking();
       const message = startError instanceof Error ? startError.message : 'Failed to start tracking.';
@@ -284,54 +447,53 @@ export default function HomeScreen() {
     };
   }, [stopTracking]);
 
+  useEffect(() => {
+    syncMap();
+  }, [syncMap]);
+
+  const onWebMessage = useCallback((event: WebViewMessageEvent) => {
+    try {
+      const payload = JSON.parse(event.nativeEvent.data);
+      if (payload?.type === 'ready') {
+        setIsMapReady(true);
+      }
+    } catch {
+      // Ignore non-JSON messages from the map.
+    }
+  }, []);
+
   return (
     <View style={styles.container}>
       <View style={styles.mapWrap}>
-        <MapView
+        <WebView
           ref={(ref) => {
-            mapRef.current = ref;
+            webViewRef.current = ref;
           }}
+          source={{ html: mapHtml }}
           style={styles.map}
-          initialRegion={DEFAULT_REGION}
-          showsUserLocation
-          showsMyLocationButton
-          onPanDrag={() => {
-            followRef.current = false;
+          originWhitelist={['*']}
+          javaScriptEnabled
+          domStorageEnabled
+          mixedContentMode="always"
+          onLoadEnd={() => {
+            setIsMapReady(true);
           }}
-          onPress={() => {
-            followRef.current = false;
-          }}
-        >
-          {samples.map((sample) => (
-            <Circle
-              key={sample.id}
-              center={{ latitude: sample.latitude, longitude: sample.longitude }}
-              radius={circleRadius(sample.strength)}
-              fillColor={strengthFillColor(sample.strength)}
-              strokeColor={strengthStrokeColor(sample.strength)}
-              strokeWidth={1}
-            />
-          ))}
-
-          {pathCoordinates.length >= 2 ? (
-            <Polyline coordinates={pathCoordinates} strokeColor="rgba(30, 41, 59, 0.65)" strokeWidth={3} />
-          ) : null}
-
-          {currentSample ? (
-            <Marker
-              coordinate={{ latitude: currentSample.latitude, longitude: currentSample.longitude }}
-              title={currentSample.ssid ?? 'Current Wi-Fi'}
-              description={`Strength ${formatNumber(currentSample.strength)} / 100`}
-            />
-          ) : null}
-        </MapView>
+          onMessage={onWebMessage}
+          startInLoadingState
+          renderLoading={() => (
+            <View style={styles.mapLoading}>
+              <ActivityIndicator color="#2563eb" />
+              <Text style={styles.mapLoadingText}>Loading web map…</Text>
+            </View>
+          )}
+        />
       </View>
 
       <View style={styles.panelWrap}>
         <ScrollView contentContainerStyle={styles.panelContent}>
           <Text style={styles.title}>Wi-Fi signal map</Text>
           <Text style={styles.subtitle}>
-            Expo Go compatible mode. This app logs the currently connected Wi-Fi signal together with GPS coordinates, writes each sample to a local CSV file, and reflects the samples on the map in real time.
+            This build uses a WebView-based map so the APK can display the map without mounting the crashing native MapView. GPS logging and CSV export stay unchanged.
           </Text>
 
           <View style={styles.buttonRow}>
@@ -339,7 +501,6 @@ export default function HomeScreen() {
               style={[styles.button, styles.primaryButton, isTracking || isStarting ? styles.buttonDisabled : null]}
               onPress={() => {
                 if (!isTracking && !isStarting) {
-                  followRef.current = true;
                   void startTracking();
                 }
               }}
@@ -408,6 +569,7 @@ export default function HomeScreen() {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Session</Text>
             <InfoRow label="Tracking" value={isTracking ? 'running' : 'stopped'} />
+            <InfoRow label="Map engine" value="WebView + Leaflet" />
             <InfoRow label="Rows written" value={String(rowsWritten)} />
             <InfoRow label="Points in memory" value={String(samples.length)} />
             <InfoRow label="Last update" value={currentSample ? currentSample.capturedAt.replace('T', ' ').replace('Z', ' UTC') : '—'} mono />
@@ -419,7 +581,7 @@ export default function HomeScreen() {
           </View>
 
           <Text style={styles.note}>
-            Limitation: Expo Go cannot scan nearby unconnected access points. It can only use libraries included in Expo Go. This reverted version tracks the signal of the currently connected Wi-Fi network instead.
+            Limitation: this Expo-compatible build still tracks only the currently connected Wi-Fi network. The web map needs network access to load the Leaflet script and map tiles.
           </Text>
         </ScrollView>
       </View>
@@ -443,10 +605,23 @@ const styles = StyleSheet.create({
   mapWrap: {
     flex: 1.05,
     minHeight: 320,
+    backgroundColor: '#dbeafe',
   },
   map: {
     width: '100%',
     height: '100%',
+    backgroundColor: '#dbeafe',
+  },
+  mapLoading: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    backgroundColor: '#dbeafe',
+  },
+  mapLoadingText: {
+    color: '#334155',
+    fontSize: 13,
   },
   panelWrap: {
     flex: 0.95,

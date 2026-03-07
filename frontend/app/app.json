@@ -5,7 +5,7 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "android": {
       "edgeToEdgeEnabled": true,
       "permissions": [
@@ -22,6 +22,11 @@
     },
     "web": {
       "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "62d470b3-d055-457a-991d-c2d522ad7ff2"
+      }
     }
   }
 }
