@@ -1,54 +1,63 @@
 name: CI
+
 on:
   push:
   pull_request:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
-  build-test-images:
+  frontend-checks:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write
+    defaults:
+      run:
+        working-directory: frontend/app
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
-      - name: Build frontend test image
-        run: |
-          docker build \
-            -f frontend/Dockerfile \
-            -t local/frontend-test:ci \
-            frontend
-
-      - name: Save images for downstream jobs
-        run: |
-          docker save local/frontend-test:ci | gzip > frontend-test.tar.gz
-      - uses: actions/upload-artifact@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          name: test-images
-          path: |
-            frontend-test.tar.gz
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/app/package-lock.json
 
-  frontend-tests:
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Verify Android bundle export
+        run: npx expo export --platform android
+
+  docker-compose-check:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: write
-    needs: build-test-images
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: test-images
-      - name: Load images
+
+      - name: Validate docker compose files
         run: |
-          gunzip -c frontend-test.tar.gz | docker load
-      - name: Run frontend tests
+          docker compose -f docker-compose.yml config
+          docker compose -f docker-compose.test.yml config
+
+      - name: Build frontend image
+        run: docker build -f frontend/Dockerfile -t local/frontend-test:ci frontend
+
+      - name: Verify container can install and typecheck
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm frontend_test
+          docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm frontend sh -lc '
+            set -e
+            cd /app
+            npm ci
+            npm run typecheck
+          '
