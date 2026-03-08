@@ -2,21 +2,10 @@
 
 
 [![CI](https://github.com/europanite/wifi_explorer/actions/workflows/ci.yml/badge.svg)](https://github.com/europanite/wifi_explorer/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/europanite/wifi_explorer/actions/workflows/codeql.yml/badge.svg)](https://github.com/europanite/wifi_explorer/actions/workflows/codeql.yml)
+[![pages](https://github.com/europanite/wifi_explorer/actions/workflows/pages/pages-build-deployment/badge.svg)](https://github.com/europanite/wifi_explorer/actions/workflows/pages/pages-build-deployment)
 
-Expo Go compatible Wi-Fi logger based on the earlier lightweight library setup.
-
-This build keeps the Expo Go-compatible react-native-maps version for SDK 54 to avoid the RNMapsAirModule runtime error.
-
-## Important limitation
-
-Expo Go cannot use custom native Wi-Fi scanning modules. Because of that, this reverted version **cannot scan nearby unconnected access points**.
-
-What it can do:
-
-- Track the signal of the **currently connected Wi-Fi network**
-- Save latitude, longitude, accuracy, SSID, BSSID, strength, frequency, and link speed to a local CSV file
-- Reflect the samples on a live map in real time
-- Export the CSV file from the device
+Expo Go compatible Wi-Fi logger.
 
 
 ```bash
@@ -39,16 +28,10 @@ npx expo start --host lan
 
 ## Troubleshooting
 
-
 ```bash
 cd frontend/app
 npx expo start --tunnel
 ```
-
-### Why nearby Wi-Fi scanning is gone
-
-Expo Go can only use libraries included in Expo Go. Nearby access point scanning required `react-native-wifi-reborn`, which is a custom native module, so it had to be removed in the Expo Go version.
-
 
 ## Build an installable APK with Docker Compose
 
