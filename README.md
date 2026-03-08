@@ -1,16 +1,11 @@
-# wifi-gps-logger-structured-expo
+# [wifi_explorer](https://github.com/europanite/wifi_explorer "wifi_explorer")
+
+
+[![CI](https://github.com/europanite/wifi_explorer/actions/workflows/ci.yml/badge.svg)](https://github.com/europanite/wifi_explorer/actions/workflows/ci.yml)
 
 Expo Go compatible Wi-Fi logger based on the earlier lightweight library setup.
 
 This build keeps the Expo Go-compatible react-native-maps version for SDK 54 to avoid the RNMapsAirModule runtime error.
-
-## What changed in this reverted version
-
-- Removed `expo-dev-client`
-- Removed `react-native-wifi-reborn`
-- Restored plain `expo start` so the QR code opens in Expo Go again
-- Kept the map view, GPS logging, local CSV writing, and CSV export
-- Switched Wi-Fi collection back to the **currently connected Wi-Fi network** through `@react-native-community/netinfo`
 
 ## Important limitation
 
@@ -23,20 +18,6 @@ What it can do:
 - Reflect the samples on a live map in real time
 - Export the CSV file from the device
 
-## Dependencies
-
-- Expo SDK 54
-- `expo-location`
-- `expo-file-system`
-- `expo-sharing`
-- `@react-native-community/netinfo`
-- `react-native-maps`
-
-## Start with Docker
-
-1. Use the included `.env` file
-2. Confirm `REACT_NATIVE_PACKAGER_HOSTNAME=192.168.3.6` matches your PC's LAN IP address
-3. Start the frontend container
 
 ```bash
 docker compose up --build
@@ -58,12 +39,6 @@ npx expo start --host lan
 
 ## Troubleshooting
 
-### Expo Go does not open the QR code
-
-- Check `REACT_NATIVE_PACKAGER_HOSTNAME` in `.env`
-- Make sure the phone and PC are on the same LAN
-- Check that ports `8081`, `19000`, `19001`, and `19002` are not blocked
-- If LAN mode still fails, try:
 
 ```bash
 cd frontend/app
@@ -99,8 +74,14 @@ Add `EXPO_TOKEN=your_token_here` to `.env`, then run:
 docker compose run --rm -e EXPO_TOKEN=$EXPO_TOKEN frontend sh -lc "npm install && npx eas-cli@latest build --platform android --profile preview --non-interactive"
 ```
 
-### Check build history
+
+### build an apk ###
 
 ```bash
-docker compose run --rm frontend sh -lc "npx eas-cli@latest build:list --platform android"
+docker compose run --rm \
+  -e EXPO_TOKEN="$EXPO_TOKEN" \
+  -e GIT_USER_NAME="" \
+  -e GIT_USER_EMAIL="" \
+  frontend \
+  sh -lc 'npm install && npm run build:apk:docker'
 ```
