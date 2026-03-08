@@ -1,6 +1,7 @@
-export type WifiSnapshot = {
+export type WifiAccessPointRecord = {
   id: string;
   sessionId: string;
+  scanId: string;
   capturedAt: string;
   latitude: number;
   longitude: number;
@@ -8,11 +9,14 @@ export type WifiSnapshot = {
   speed: number | null;
   ssid: string | null;
   bssid: string | null;
-  strength: number | null;
+  rssiDbm: number | null;
   frequency: number | null;
-  linkSpeed: number | null;
-  isConnected: boolean;
-  isInternetReachable: boolean | null;
+  capabilities: string;
+  timestampMicros: number | null;
+  isOpenAuth: boolean;
+  isLikelyFree: boolean;
+  freeReason: string;
+  securityLabel: string;
 };
 
 export type SessionInfo = {

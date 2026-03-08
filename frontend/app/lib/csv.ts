@@ -1,9 +1,10 @@
 import * as FileSystem from 'expo-file-system/legacy';
-import { SessionInfo, WifiSnapshot } from '../types/wifi';
+import { SessionInfo, WifiAccessPointRecord } from '../types/wifi';
 
-const DIRECTORY_NAME = 'wifi-gps-logs';
+const DIRECTORY_NAME = 'wifi-survey-logs';
 const CSV_HEADER = [
   'session_id',
+  'scan_id',
   'captured_at',
   'latitude',
   'longitude',
@@ -11,11 +12,14 @@ const CSV_HEADER = [
   'speed_mps',
   'ssid',
   'bssid',
-  'strength_pct',
+  'rssi_dbm',
   'frequency_mhz',
-  'link_speed_mbps',
-  'is_connected',
-  'is_internet_reachable'
+  'capabilities',
+  'timestamp_micros',
+  'is_open_auth',
+  'is_likely_free',
+  'free_reason',
+  'security_label'
 ].join(',');
 
 function documentRoot(): string {
@@ -50,26 +54,35 @@ export async function createSessionFile(sessionId: string): Promise<SessionInfo>
   return { sessionId, fileUri, startedAt };
 }
 
-function snapshotToCsvRow(snapshot: WifiSnapshot): string {
+function recordToCsvRow(record: WifiAccessPointRecord): string {
   return [
-    snapshot.sessionId,
-    snapshot.capturedAt,
-    snapshot.latitude,
-    snapshot.longitude,
-    snapshot.accuracy,
-    snapshot.speed,
-    snapshot.ssid,
-    snapshot.bssid,
-    snapshot.strength,
-    snapshot.frequency,
-    snapshot.linkSpeed,
-    snapshot.isConnected,
-    snapshot.isInternetReachable,
+    record.sessionId,
+    record.scanId,
+    record.capturedAt,
+    record.latitude,
+    record.longitude,
+    record.accuracy,
+    record.speed,
+    record.ssid,
+    record.bssid,
+    record.rssiDbm,
+    record.frequency,
+    record.capabilities,
+    record.timestampMicros,
+    record.isOpenAuth,
+    record.isLikelyFree,
+    record.freeReason,
+    record.securityLabel,
   ].map(escapeCsvCell).join(',');
 }
 
-export async function appendSnapshot(fileUri: string, snapshot: WifiSnapshot): Promise<void> {
-  await FileSystem.writeAsStringAsync(fileUri, `${snapshotToCsvRow(snapshot)}\n`, {
+export async function appendRecords(fileUri: string, records: WifiAccessPointRecord[]): Promise<void> {
+  if (!records.length) {
+    return;
+  }
+
+  const body = records.map((record) => recordToCsvRow(record)).join('\n');
+  await FileSystem.writeAsStringAsync(fileUri, `${body}\n`, {
     append: true,
     encoding: FileSystem.EncodingType.UTF8,
   });

@@ -6,18 +6,25 @@
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": false,
+    "plugins": [
+      "react-native-wifi-reborn"
+    ],
     "android": {
       "edgeToEdgeEnabled": true,
       "permissions": [
         "ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION"
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_WIFI_STATE",
+        "CHANGE_WIFI_STATE",
+        "NEARBY_WIFI_DEVICES"
       ],
       "package": "com.europanite.wifigpslogger"
     },
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Allow the app to read your location while tracking the connected Wi-Fi signal."
+        "NSLocationWhenInUseUsageDescription": "Allow the app to read your location while tracking nearby Wi-Fi networks.",
+        "NSLocalNetworkUsageDescription": "Allow the app to inspect nearby Wi-Fi information on supported builds."
       }
     },
     "web": {

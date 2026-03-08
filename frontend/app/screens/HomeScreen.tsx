@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Linking,
+  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -9,78 +11,85 @@ import {
   Text,
   View,
 } from 'react-native';
-import NetInfo, { NetInfoState, NetInfoSubscription } from '@react-native-community/netinfo';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
+import WifiManager from 'react-native-wifi-reborn';
 import SignalLegend from '../components/SignalLegend';
-import { appendSnapshot, createSessionFile } from '../lib/csv';
-import { circleRadius, strengthFillColor, strengthLabel, strengthStrokeColor } from '../lib/signal';
-import { SessionInfo, WifiSnapshot } from '../types/wifi';
+import { appendRecords, createSessionFile } from '../lib/csv';
+import { classifyWifiNetwork, offsetCoordinate, rssiFillColor, rssiLabel, rssiStrokeColor } from '../lib/wifiFlags';
+import { SessionInfo, WifiAccessPointRecord } from '../types/wifi';
 
 const DEFAULT_CENTER = {
   latitude: 35.681236,
   longitude: 139.767125,
 };
 
-const WIFI_POLL_MS = 3000;
-const MIN_MOVE_METERS = 8;
-const MIN_STRENGTH_DELTA = 4;
-const MAX_POINTS_IN_MEMORY = 600;
+const SCAN_INTERVAL_MS = 30000;
+const MAX_VISIBLE_POINTS = 300;
+const MAX_LIST_ITEMS = 40;
+
+type PermissionState = 'pending' | 'granted' | 'denied' | 'blocked';
+
+type WifiScanEntry = {
+  SSID?: string;
+  BSSID?: string;
+  capabilities?: string;
+  frequency?: number | string;
+  level?: number | string;
+  timestamp?: number | string;
+};
+
+type Coordinate = {
+  latitude: number;
+  longitude: number;
+};
 
 type WebMapPoint = {
   id: string;
   latitude: number;
   longitude: number;
   ssid: string | null;
-  strength: number | null;
+  bssid: string | null;
+  rssiDbm: number | null;
   fillColor: string;
   strokeColor: string;
-  radius: number;
+  isOpenAuth: boolean;
+  isLikelyFree: boolean;
 };
 
 type WebMapPayload = {
-  center: { latitude: number; longitude: number };
-  samples: WebMapPoint[];
+  center: Coordinate;
+  points: WebMapPoint[];
   path: Array<[number, number]>;
-  current: WebMapPoint | null;
+  currentLocation: Coordinate | null;
 };
 
 function makeSessionId(): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  return `wifi-log-${stamp}`;
+  return `wifi-survey-${stamp}`;
 }
 
-function toNullableNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+function makeScanId(): string {
+  return `scan-${Date.now()}`;
 }
 
-function getWifiDetails(state: NetInfoState | null) {
-  const details = ((state?.details ?? {}) as Record<string, unknown>);
-  return {
-    ssid: typeof details.ssid === 'string' ? details.ssid : null,
-    bssid: typeof details.bssid === 'string' ? details.bssid : null,
-    strength: toNullableNumber(details.strength),
-    frequency: toNullableNumber(details.frequency),
-    linkSpeed: toNullableNumber(details.linkSpeed),
-  };
+function coerceNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  return null;
 }
 
 function formatNumber(value: number | null, digits = 0): string {
   return value == null ? '—' : value.toFixed(digits);
 }
 
-function distanceMeters(a: Pick<WifiSnapshot, 'latitude' | 'longitude'>, b: Pick<WifiSnapshot, 'latitude' | 'longitude'>): number {
-  const toRad = (n: number) => (n * Math.PI) / 180;
-  const earthRadius = 6371000;
-  const dLat = toRad(b.latitude - a.latitude);
-  const dLon = toRad(b.longitude - a.longitude);
-  const lat1 = toRad(a.latitude);
-  const lat2 = toRad(b.latitude);
-  const sinLat = Math.sin(dLat / 2);
-  const sinLon = Math.sin(dLon / 2);
-  const h = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
-  return 2 * earthRadius * Math.asin(Math.sqrt(h));
+function permissionLabel(value: PermissionState): string {
+  if (value === 'blocked') return 'blocked';
+  return value;
 }
 
 function makeLeafletHtml(): string {
@@ -89,7 +98,7 @@ function makeLeafletHtml(): string {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
     <style>
       html, body, #map { height: 100%; margin: 0; padding: 0; background: #dbeafe; }
       body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -102,17 +111,19 @@ function makeLeafletHtml(): string {
         bottom: 12px;
         padding: 8px 10px;
         border-radius: 10px;
-        background: rgba(15, 23, 42, 0.82);
+        background: rgba(15, 23, 42, 0.84);
         color: white;
         font-size: 12px;
         line-height: 1.4;
       }
+      .popup-row { margin: 2px 0; }
+      .popup-row strong { display: inline-block; min-width: 54px; }
     </style>
   </head>
   <body>
     <div id="map"></div>
     <div id="status">Loading map…</div>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
     <script>
       (function () {
         const statusEl = document.getElementById('status');
@@ -125,53 +136,60 @@ function makeLeafletHtml(): string {
           return;
         }
 
-        const initialCenter = [35.681236, 139.767125];
-        const map = L.map('map', { zoomControl: true }).setView(initialCenter, 16);
-
+        const map = L.map('map', { zoomControl: true }).setView([35.681236, 139.767125], 16);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
           maxZoom: 19,
           attribution: '&copy; OpenStreetMap contributors'
         }).addTo(map);
 
-        const circlesLayer = L.layerGroup().addTo(map);
+        const pointLayer = L.layerGroup().addTo(map);
         const pathLayer = L.layerGroup().addTo(map);
-        const markerLayer = L.layerGroup().addTo(map);
+        const locationLayer = L.layerGroup().addTo(map);
         let hasFitted = false;
+
+        function popupHtml(point) {
+          return [
+            '<div class="popup-row"><strong>SSID</strong>' + (point.ssid || '(hidden)') + '</div>',
+            '<div class="popup-row"><strong>BSSID</strong>' + (point.bssid || '—') + '</div>',
+            '<div class="popup-row"><strong>RSSI</strong>' + (point.rssiDbm == null ? '—' : point.rssiDbm + ' dBm') + '</div>',
+            '<div class="popup-row"><strong>Open</strong>' + (point.isOpenAuth ? 'yes' : 'no') + '</div>',
+            '<div class="popup-row"><strong>Free?</strong>' + (point.isLikelyFree ? 'yes' : 'no') + '</div>'
+          ].join('');
+        }
 
         window.__applyPayload = function (payload) {
           try {
-            circlesLayer.clearLayers();
+            pointLayer.clearLayers();
             pathLayer.clearLayers();
-            markerLayer.clearLayers();
+            locationLayer.clearLayers();
 
-            const points = Array.isArray(payload.samples) ? payload.samples : [];
+            const points = Array.isArray(payload.points) ? payload.points : [];
             const path = Array.isArray(payload.path) ? payload.path : [];
-            const current = payload.current || null;
+            const currentLocation = payload.currentLocation || null;
             const center = payload.center || { latitude: 35.681236, longitude: 139.767125 };
 
             points.forEach(function (point) {
               L.circleMarker([point.latitude, point.longitude], {
-                radius: point.radius,
+                radius: 8,
                 color: point.strokeColor,
                 weight: 1,
                 fillColor: point.fillColor,
-                fillOpacity: 0.9,
-              })
-                .bindPopup((point.ssid || 'Current Wi-Fi') + '<br/>Strength: ' + (point.strength == null ? '—' : point.strength + '/100'))
-                .addTo(circlesLayer);
+                fillOpacity: 0.92,
+              }).bindPopup(popupHtml(point)).addTo(pointLayer);
             });
 
             if (path.length >= 2) {
-              L.polyline(path, {
-                color: 'rgba(30, 41, 59, 0.85)',
-                weight: 3,
-              }).addTo(pathLayer);
+              L.polyline(path, { color: '#0f172a', weight: 3, opacity: 0.7 }).addTo(pathLayer);
             }
 
-            if (current) {
-              L.marker([current.latitude, current.longitude])
-                .bindPopup((current.ssid || 'Current Wi-Fi') + '<br/>Strength: ' + (current.strength == null ? '—' : current.strength + '/100'))
-                .addTo(markerLayer);
+            if (currentLocation) {
+              L.circleMarker([currentLocation.latitude, currentLocation.longitude], {
+                radius: 10,
+                color: '#2563eb',
+                weight: 2,
+                fillColor: '#60a5fa',
+                fillOpacity: 0.9,
+              }).bindPopup('Current position').addTo(locationLayer);
             }
 
             if (!hasFitted) {
@@ -181,11 +199,11 @@ function makeLeafletHtml(): string {
               } else {
                 map.setView([center.latitude, center.longitude], 16);
               }
-            } else if (current) {
-              map.panTo([current.latitude, current.longitude], { animate: true, duration: 0.35 });
+            } else if (currentLocation) {
+              map.panTo([currentLocation.latitude, currentLocation.longitude], { animate: true, duration: 0.35 });
             }
 
-            setStatus(points.length > 0 ? ('Samples: ' + points.length) : 'Waiting for samples…');
+            setStatus('Visible networks: ' + points.length);
           } catch (error) {
             setStatus('Map render error: ' + (error && error.message ? error.message : String(error)));
           }
@@ -211,523 +229,609 @@ function makeLeafletHtml(): string {
 </html>`;
 }
 
+async function requestAndroidWifiPermissionsDetailed(): Promise<PermissionState> {
+  if (Platform.OS !== 'android') {
+    return 'granted';
+  }
+
+  const permissions = [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+
+  if (Platform.Version >= 33 && PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES) {
+    permissions.push(PermissionsAndroid.PERMISSIONS.NEARBY_WIFI_DEVICES);
+  }
+
+  const result = await PermissionsAndroid.requestMultiple(permissions);
+  const values = permissions.map((permission) => result[permission]);
+
+  if (values.every((value) => value === PermissionsAndroid.RESULTS.GRANTED)) {
+    return 'granted';
+  }
+  if (values.some((value) => value === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN)) {
+    return 'blocked';
+  }
+  return 'denied';
+}
+
+async function requestLocationPermissionDetailed(): Promise<PermissionState> {
+  const current = await Location.getForegroundPermissionsAsync();
+  if (current.granted) {
+    return 'granted';
+  }
+
+  const requested = await Location.requestForegroundPermissionsAsync();
+  if (requested.granted) {
+    return 'granted';
+  }
+
+  return requested.canAskAgain ? 'denied' : 'blocked';
+}
+
 export default function HomeScreen() {
   const webViewRef = useRef<WebView | null>(null);
   const locationSubRef = useRef<Location.LocationSubscription | null>(null);
-  const netInfoSubRef = useRef<NetInfoSubscription | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sessionRef = useRef<SessionInfo | null>(null);
+  const latestLocationRef = useRef<Location.LocationObject | null>(null);
+  const mapReadyRef = useRef(false);
+  const samplesByBssidRef = useRef<Map<string, WifiAccessPointRecord>>(new Map());
 
-  const [isStarting, setIsStarting] = useState(false);
-  const [isTracking, setIsTracking] = useState(false);
-  const [isMapReady, setIsMapReady] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [statusText, setStatusText] = useState('Ready');
-  const [session, setSession] = useState<SessionInfo | null>(null);
-  const [samples, setSamples] = useState<WifiSnapshot[]>([]);
-  const [currentLocation, setCurrentLocation] = useState<Location.LocationObjectCoords | null>(null);
-  const [wifiState, setWifiState] = useState<NetInfoState | null>(null);
-  const [rowsWritten, setRowsWritten] = useState(0);
+  const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null);
+  const [statusText, setStatusText] = useState('Preparing Wi-Fi survey session…');
+  const [isBusy, setIsBusy] = useState(true);
+  const [isScanning, setIsScanning] = useState(false);
+  const [locationPermission, setLocationPermission] = useState<PermissionState>('pending');
+  const [wifiPermission, setWifiPermission] = useState<PermissionState>('pending');
+  const [locationServicesOn, setLocationServicesOn] = useState<boolean | null>(null);
+  const [lastLocation, setLastLocation] = useState<Location.LocationObject | null>(null);
+  const [route, setRoute] = useState<Coordinate[]>([]);
+  const [latestScan, setLatestScan] = useState<WifiAccessPointRecord[]>([]);
+  const [visibleSamples, setVisibleSamples] = useState<WifiAccessPointRecord[]>([]);
 
-  const currentWifi = useMemo(() => {
-    const details = getWifiDetails(wifiState);
-    return {
-      ...details,
-      isConnected: Boolean(wifiState?.isConnected) && wifiState?.type === 'wifi',
-      isInternetReachable: wifiState?.isInternetReachable ?? null,
-    };
-  }, [wifiState]);
-
-  const currentSample = samples.length > 0 ? samples[samples.length - 1] : null;
-
-  const webMapPayload = useMemo<WebMapPayload>(() => {
-    const center = currentLocation
-      ? { latitude: currentLocation.latitude, longitude: currentLocation.longitude }
-      : currentSample
-        ? { latitude: currentSample.latitude, longitude: currentSample.longitude }
-        : DEFAULT_CENTER;
-
-    const mappedSamples = samples.map((sample) => ({
-      id: sample.id,
-      latitude: sample.latitude,
-      longitude: sample.longitude,
-      ssid: sample.ssid,
-      strength: sample.strength,
-      fillColor: strengthFillColor(sample.strength),
-      strokeColor: strengthStrokeColor(sample.strength),
-      radius: Math.max(5, Math.min(18, circleRadius(sample.strength) / 2.2)),
-    }));
-
-    return {
-      center,
-      samples: mappedSamples,
-      path: samples.map((sample) => [sample.latitude, sample.longitude] as [number, number]),
-      current: mappedSamples.length > 0 ? mappedSamples[mappedSamples.length - 1] : null,
-    };
-  }, [currentLocation, currentSample, samples]);
-
-  const mapHtml = useMemo(() => makeLeafletHtml(), []);
-
-  const syncMap = useCallback(() => {
-    if (!isMapReady || !webViewRef.current) {
+  const sendPayloadToMap = useCallback((records: WifiAccessPointRecord[], currentLocation: Location.LocationObject | null, currentRoute: Coordinate[]) => {
+    if (!mapReadyRef.current || !webViewRef.current) {
       return;
     }
 
-    const payload = JSON.stringify(webMapPayload).replace(/</g, '\\u003c');
-    webViewRef.current.injectJavaScript(`window.__applyPayload(${payload}); true;`);
-  }, [isMapReady, webMapPayload]);
-
-  const stopTracking = useCallback(() => {
-    locationSubRef.current?.remove();
-    locationSubRef.current = null;
-
-    netInfoSubRef.current?.();
-    netInfoSubRef.current = null;
-
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-
-    setIsTracking(false);
-    setStatusText((previous) => (previous === 'Ready' ? previous : 'Tracking stopped.'));
-  }, []);
-
-  const readWifiState = useCallback(async () => {
-    const state = await NetInfo.fetch('wifi');
-    setWifiState(state);
-    return state;
-  }, []);
-
-  const appendTrackedSnapshot = useCallback(async (
-    coords: Location.LocationObjectCoords,
-    netState: NetInfoState | null,
-  ) => {
-    const activeSession = sessionRef.current;
-    if (!activeSession) {
-      throw new Error('No active session is available.');
-    }
-
-    const details = getWifiDetails(netState);
-    const snapshot: WifiSnapshot = {
-      id: `${activeSession.sessionId}-${Date.now()}`,
-      sessionId: activeSession.sessionId,
-      capturedAt: new Date().toISOString(),
-      latitude: coords.latitude,
-      longitude: coords.longitude,
-      accuracy: toNullableNumber(coords.accuracy),
-      speed: toNullableNumber(coords.speed),
-      ssid: details.ssid,
-      bssid: details.bssid,
-      strength: details.strength,
-      frequency: details.frequency,
-      linkSpeed: details.linkSpeed,
-      isConnected: Boolean(netState?.isConnected) && netState?.type === 'wifi',
-      isInternetReachable: netState?.isInternetReachable ?? null,
-    };
-
-    setSamples((previous) => {
-      const last = previous[previous.length - 1];
-      if (last) {
-        const moved = distanceMeters(last, snapshot);
-        const strengthGap = Math.abs((last.strength ?? -1) - (snapshot.strength ?? -1));
-        const sameNetwork = last.bssid === snapshot.bssid && last.ssid === snapshot.ssid;
-
-        if (sameNetwork && moved < MIN_MOVE_METERS && strengthGap < MIN_STRENGTH_DELTA) {
-          return previous;
-        }
-      }
-
-      void appendSnapshot(activeSession.fileUri, snapshot)
-        .then(() => {
-          setRowsWritten((count) => count + 1);
-        })
-        .catch((appendError: unknown) => {
-          const message = appendError instanceof Error ? appendError.message : 'Failed to append CSV data.';
-          setError(message);
-          setStatusText(message);
-        });
-
-      return [...previous, snapshot].slice(-MAX_POINTS_IN_MEMORY);
+    const points: WebMapPoint[] = records.slice(0, MAX_VISIBLE_POINTS).map((record, index) => {
+      const offset = offsetCoordinate(record.latitude, record.longitude, record.bssid ?? record.ssid ?? String(index), index);
+      return {
+        id: record.id,
+        latitude: offset.latitude,
+        longitude: offset.longitude,
+        ssid: record.ssid,
+        bssid: record.bssid,
+        rssiDbm: record.rssiDbm,
+        fillColor: rssiFillColor(record.rssiDbm),
+        strokeColor: rssiStrokeColor(record.rssiDbm),
+        isOpenAuth: record.isOpenAuth,
+        isLikelyFree: record.isLikelyFree,
+      };
     });
 
-    setCurrentLocation(coords);
+    const payload: WebMapPayload = {
+      center: currentLocation?.coords
+        ? { latitude: currentLocation.coords.latitude, longitude: currentLocation.coords.longitude }
+        : DEFAULT_CENTER,
+      currentLocation: currentLocation?.coords
+        ? { latitude: currentLocation.coords.latitude, longitude: currentLocation.coords.longitude }
+        : null,
+      path: currentRoute.map((point) => [point.latitude, point.longitude]),
+      points,
+    };
+
+    webViewRef.current.postMessage(JSON.stringify(payload));
   }, []);
 
-  const handleLocationUpdate = useCallback(async (location: Location.LocationObject) => {
-    const latestWifi = await readWifiState().catch(() => wifiState);
-    await appendTrackedSnapshot(location.coords, latestWifi ?? wifiState);
-  }, [appendTrackedSnapshot, readWifiState, wifiState]);
+  const refreshVisibleSamples = useCallback((currentLocation: Location.LocationObject | null, currentRoute: Coordinate[] = route) => {
+    const records = Array.from(samplesByBssidRef.current.values())
+      .sort((a, b) => (b.rssiDbm ?? -999) - (a.rssiDbm ?? -999))
+      .slice(0, MAX_VISIBLE_POINTS);
+    setVisibleSamples(records);
+    sendPayloadToMap(records, currentLocation, currentRoute);
+  }, [route, sendPayloadToMap]);
 
-  const startTracking = useCallback(async () => {
-    setError(null);
-    setIsStarting(true);
-
+  const onMapMessage = useCallback((event: WebViewMessageEvent) => {
     try {
-      const permission = await Location.requestForegroundPermissionsAsync();
-      if (permission.status !== 'granted') {
-        throw new Error('Foreground location permission was denied.');
+      const payload = JSON.parse(event.nativeEvent.data);
+      if (payload?.type === 'ready') {
+        mapReadyRef.current = true;
+        sendPayloadToMap(visibleSamples, lastLocation, route);
       }
-
-      if (Platform.OS === 'android') {
-        await Location.enableNetworkProviderAsync().catch(() => undefined);
-      }
-
-      const nextSession = await createSessionFile(makeSessionId());
-      sessionRef.current = nextSession;
-      setSession(nextSession);
-      setSamples([]);
-      setRowsWritten(0);
-
-      const initialLocation = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Balanced,
-      });
-      const initialWifi = await readWifiState();
-      await appendTrackedSnapshot(initialLocation.coords, initialWifi);
-
-      netInfoSubRef.current?.();
-      netInfoSubRef.current = NetInfo.addEventListener((state) => {
-        setWifiState(state);
-      });
-
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-      }
-      pollRef.current = setInterval(() => {
-        void readWifiState().catch(() => undefined);
-      }, WIFI_POLL_MS);
-
-      locationSubRef.current?.remove();
-      locationSubRef.current = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.Balanced,
-          timeInterval: 2500,
-          distanceInterval: 3,
-          mayShowUserSettingsDialog: true,
-        },
-        (location) => {
-          void handleLocationUpdate(location);
-        },
-      );
-
-      setIsTracking(true);
-      setStatusText('Tracking is running.');
-    } catch (startError: unknown) {
-      stopTracking();
-      const message = startError instanceof Error ? startError.message : 'Failed to start tracking.';
-      setError(message);
-      setStatusText(message);
-    } finally {
-      setIsStarting(false);
+    } catch {
+      // Ignore malformed messages from the web view.
     }
-  }, [appendTrackedSnapshot, handleLocationUpdate, readWifiState, stopTracking]);
+  }, [lastLocation, route, sendPayloadToMap, visibleSamples]);
 
-  const shareCsv = useCallback(async () => {
-    if (!session?.fileUri) {
-      Alert.alert('No session file', 'Start tracking before exporting CSV data.');
+  const ensureSession = useCallback(async () => {
+    if (sessionRef.current) {
+      return sessionRef.current;
+    }
+    const info = await createSessionFile(makeSessionId());
+    sessionRef.current = info;
+    setSessionInfo(info);
+    return info;
+  }, []);
+
+  const startLocationTracking = useCallback(async () => {
+    const servicesEnabled = await Location.hasServicesEnabledAsync();
+    setLocationServicesOn(servicesEnabled);
+
+    if (!servicesEnabled) {
+      try {
+        await Location.enableNetworkProviderAsync();
+        setLocationServicesOn(true);
+      } catch {
+        throw new Error('Location services are off. Turn GPS on and try again.');
+      }
+    }
+
+    const lastKnown = await Location.getLastKnownPositionAsync({
+      maxAge: 60000,
+      requiredAccuracy: 100,
+    });
+
+    if (lastKnown) {
+      latestLocationRef.current = lastKnown;
+      setLastLocation(lastKnown);
+      const nextRoute = [{ latitude: lastKnown.coords.latitude, longitude: lastKnown.coords.longitude }];
+      setRoute(nextRoute);
+      sendPayloadToMap(visibleSamples, lastKnown, nextRoute);
+    }
+
+    locationSubRef.current?.remove();
+    locationSubRef.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.Balanced,
+        timeInterval: 4000,
+        distanceInterval: 5,
+        mayShowUserSettingsDialog: true,
+      },
+      (location) => {
+        latestLocationRef.current = location;
+        setLastLocation(location);
+        setRoute((currentRoute) => {
+          const nextPoint = { latitude: location.coords.latitude, longitude: location.coords.longitude };
+          const nextRoute = [...currentRoute, nextPoint].slice(-MAX_VISIBLE_POINTS);
+          sendPayloadToMap(visibleSamples, location, nextRoute);
+          return nextRoute;
+        });
+      }
+    );
+  }, [sendPayloadToMap, visibleSamples]);
+
+  const runWifiScan = useCallback(async (forceRescan: boolean) => {
+    if (isScanning) {
       return;
     }
 
-    const sharingAvailable = await Sharing.isAvailableAsync();
-    if (!sharingAvailable) {
-      Alert.alert('Sharing unavailable', 'The system share sheet is not available on this device.');
+    const session = await ensureSession();
+    const location = latestLocationRef.current;
+    if (!location) {
+      setStatusText('Waiting for a GPS fix before starting Wi‑Fi scans.');
+      return;
+    }
+
+    setIsScanning(true);
+    try {
+      const entries = (((forceRescan ? await WifiManager.reScanAndLoadWifiList() : await WifiManager.loadWifiList()) as WifiScanEntry[]) ?? []);
+      const scanId = makeScanId();
+      const capturedAt = new Date().toISOString();
+      const records: WifiAccessPointRecord[] = entries.map((entry, index) => {
+        const ssid = typeof entry.SSID === 'string' && entry.SSID.trim() ? entry.SSID.trim() : null;
+        const bssid = typeof entry.BSSID === 'string' && entry.BSSID.trim() ? entry.BSSID.trim() : null;
+        const capabilities = typeof entry.capabilities === 'string' ? entry.capabilities : '';
+        const rssiDbm = coerceNumber(entry.level);
+        const frequency = coerceNumber(entry.frequency);
+        const flags = classifyWifiNetwork(ssid, capabilities);
+        const id = [session.sessionId, scanId, bssid ?? ssid ?? String(index), index].join(':');
+
+        return {
+          id,
+          sessionId: session.sessionId,
+          scanId,
+          capturedAt,
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          accuracy: location.coords.accuracy ?? null,
+          speed: location.coords.speed ?? null,
+          ssid,
+          bssid,
+          rssiDbm,
+          frequency,
+          capabilities,
+          timestampMicros: coerceNumber(entry.timestamp),
+          isOpenAuth: flags.isOpenAuth,
+          isLikelyFree: flags.isLikelyFree,
+          freeReason: flags.freeReason,
+          securityLabel: flags.securityLabel,
+        };
+      });
+
+      await appendRecords(session.fileUri, records);
+
+      const latestByBssid = samplesByBssidRef.current;
+      for (const record of records) {
+        const key = record.bssid ?? `${record.ssid ?? 'hidden'}:${record.frequency ?? 'na'}`;
+        latestByBssid.set(key, record);
+      }
+
+      const strongestFirst = [...records].sort((a, b) => (b.rssiDbm ?? -999) - (a.rssiDbm ?? -999));
+      setLatestScan(strongestFirst.slice(0, MAX_LIST_ITEMS));
+
+      const openCount = records.filter((record) => record.isOpenAuth).length;
+      const freeCount = records.filter((record) => record.isLikelyFree).length;
+      setStatusText(`Scan saved: ${records.length} networks (${openCount} open, ${freeCount} free-flagged).`);
+      refreshVisibleSamples(location);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusText(`Wi‑Fi scan failed: ${message}`);
+    } finally {
+      setIsScanning(false);
+    }
+  }, [ensureSession, isScanning, refreshVisibleSamples]);
+
+  const exportCsv = useCallback(async () => {
+    const session = sessionRef.current;
+    if (!session) {
+      Alert.alert('Nothing to export', 'Start a scan session first.');
+      return;
+    }
+
+    const available = await Sharing.isAvailableAsync();
+    if (!available) {
+      Alert.alert('Sharing unavailable', 'This device cannot share files from the app.');
       return;
     }
 
     await Sharing.shareAsync(session.fileUri, {
-      dialogTitle: 'Export Wi-Fi log CSV',
+      dialogTitle: 'Export nearby Wi‑Fi survey CSV',
       mimeType: 'text/csv',
       UTI: 'public.comma-separated-values-text',
     });
-  }, [session]);
-
-  useEffect(() => {
-    return () => {
-      stopTracking();
-    };
-  }, [stopTracking]);
-
-  useEffect(() => {
-    syncMap();
-  }, [syncMap]);
-
-  const onWebMessage = useCallback((event: WebViewMessageEvent) => {
-    try {
-      const payload = JSON.parse(event.nativeEvent.data);
-      if (payload?.type === 'ready') {
-        setIsMapReady(true);
-      }
-    } catch {
-      // Ignore non-JSON messages from the map.
-    }
   }, []);
 
+  useEffect(() => {
+    let mounted = true;
+
+    async function bootstrap() {
+      setIsBusy(true);
+      try {
+        await ensureSession();
+
+        const nextLocationPermission = await requestLocationPermissionDetailed();
+        if (!mounted) return;
+        setLocationPermission(nextLocationPermission);
+
+        const nextWifiPermission = await requestAndroidWifiPermissionsDetailed();
+        if (!mounted) return;
+        setWifiPermission(nextWifiPermission);
+
+        if (nextLocationPermission !== 'granted') {
+          setStatusText(
+            nextLocationPermission === 'blocked'
+              ? 'Location permission is blocked. Open app settings and allow it.'
+              : 'Location permission was denied.'
+          );
+          return;
+        }
+
+        if (nextWifiPermission !== 'granted') {
+          setStatusText(
+            nextWifiPermission === 'blocked'
+              ? 'Wi‑Fi scan permission is blocked. Open app settings and allow Nearby devices / Location.'
+              : 'Wi‑Fi scan permission was denied.'
+          );
+          return;
+        }
+
+        await startLocationTracking();
+        if (!mounted) return;
+
+        setStatusText('Ready. APK build scans every 30 seconds and saves all visible networks.');
+        runWifiScan(true).catch(() => undefined);
+        scanTimerRef.current = setInterval(() => {
+          runWifiScan(false).catch(() => undefined);
+        }, SCAN_INTERVAL_MS);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (mounted) {
+          setStatusText(message);
+        }
+      } finally {
+        if (mounted) {
+          setIsBusy(false);
+        }
+      }
+    }
+
+    bootstrap();
+
+    return () => {
+      mounted = false;
+      if (scanTimerRef.current) {
+        clearInterval(scanTimerRef.current);
+        scanTimerRef.current = null;
+      }
+      if (locationSubRef.current) {
+        locationSubRef.current.remove();
+        locationSubRef.current = null;
+      }
+    };
+  }, [ensureSession, runWifiScan, startLocationTracking]);
+
+  useEffect(() => {
+    sendPayloadToMap(visibleSamples, lastLocation, route);
+  }, [lastLocation, route, sendPayloadToMap, visibleSamples]);
+
+  const summary = useMemo(() => {
+    const openCount = latestScan.filter((record) => record.isOpenAuth).length;
+    const freeCount = latestScan.filter((record) => record.isLikelyFree).length;
+    return {
+      total: latestScan.length,
+      openCount,
+      freeCount,
+    };
+  }, [latestScan]);
+
   return (
-    <View style={styles.container}>
-      <View style={styles.mapWrap}>
-        <WebView
-          ref={(ref) => {
-            webViewRef.current = ref;
-          }}
-          source={{ html: mapHtml }}
-          style={styles.map}
-          originWhitelist={['*']}
-          javaScriptEnabled
-          domStorageEnabled
-          mixedContentMode="always"
-          onLoadEnd={() => {
-            setIsMapReady(true);
-          }}
-          onMessage={onWebMessage}
-          startInLoadingState
-          renderLoading={() => (
-            <View style={styles.mapLoading}>
-              <ActivityIndicator color="#2563eb" />
-              <Text style={styles.mapLoadingText}>Loading web map…</Text>
+    <ScrollView contentContainerStyle={styles.content}>
+      <View style={styles.headerBlock}>
+        <Text style={styles.title}>Nearby Wi‑Fi Survey</Text>
+        <Text style={styles.subtitle}>
+          Android APK mode: scan every visible SSID/BSSID, save all rows to CSV, and flag open or likely free hotspots.
+        </Text>
+      </View>
+
+      <View style={styles.mapCard}>
+        <View style={styles.mapWrap}>
+          <WebView
+            ref={(ref) => {
+              webViewRef.current = ref;
+            }}
+            source={{ html: makeLeafletHtml() }}
+            originWhitelist={['*']}
+            javaScriptEnabled
+            domStorageEnabled
+            onMessage={onMapMessage}
+            style={styles.map}
+          />
+        </View>
+        <View style={styles.legendWrap}>
+          <SignalLegend />
+        </View>
+      </View>
+
+      <View style={styles.panelCard}>
+        <View style={styles.metaGrid}>
+          <Text style={styles.metaLine}>Session: {sessionInfo?.sessionId ?? 'starting…'}</Text>
+          <Text style={styles.metaLine}>Location permission: {permissionLabel(locationPermission)}</Text>
+          <Text style={styles.metaLine}>Wi‑Fi permission: {permissionLabel(wifiPermission)}</Text>
+          <Text style={styles.metaLine}>Location services: {locationServicesOn == null ? 'checking…' : locationServicesOn ? 'on' : 'off'}</Text>
+          <Text style={styles.metaLine}>
+            Last GPS: {lastLocation ? `${lastLocation.coords.latitude.toFixed(5)}, ${lastLocation.coords.longitude.toFixed(5)}` : 'waiting…'}
+          </Text>
+          <Text style={styles.metaLine}>Visible list: {summary.total} items</Text>
+          <Text style={styles.metaLine}>Open auth: {summary.openCount}</Text>
+          <Text style={styles.metaLine}>Free-flagged: {summary.freeCount}</Text>
+        </View>
+
+        <Text style={styles.status}>{statusText}</Text>
+
+        {isBusy ? (
+          <View style={styles.loadingRow}>
+            <ActivityIndicator />
+            <Text style={styles.loadingText}>Initializing permissions and sensors…</Text>
+          </View>
+        ) : null}
+
+        <View style={styles.buttonRow}>
+          <Pressable
+            style={[styles.button, styles.primaryButton, isScanning ? styles.disabledButton : null]}
+            onPress={() => {
+              runWifiScan(true).catch(() => undefined);
+            }}
+            disabled={isScanning}
+          >
+            <Text style={styles.primaryButtonText}>{isScanning ? 'Scanning…' : 'Scan now'}</Text>
+          </Pressable>
+
+          <Pressable style={[styles.button, styles.secondaryButton]} onPress={() => {
+            exportCsv().catch((error) => {
+              const message = error instanceof Error ? error.message : String(error);
+              Alert.alert('Export failed', message);
+            });
+          }}>
+            <Text style={styles.secondaryButtonText}>Export CSV</Text>
+          </Pressable>
+
+          {(locationPermission === 'blocked' || wifiPermission === 'blocked') ? (
+            <Pressable style={[styles.button, styles.secondaryButton]} onPress={() => Linking.openSettings()}>
+              <Text style={styles.secondaryButtonText}>Open settings</Text>
+            </Pressable>
+          ) : null}
+        </View>
+      </View>
+
+      <View style={styles.listCard}>
+        <Text style={styles.sectionTitle}>Latest scan results</Text>
+        {latestScan.length ? latestScan.map((record) => (
+          <View key={record.id} style={styles.listRow}>
+            <View style={styles.listMain}>
+              <Text style={styles.listSsid}>{record.ssid || '(hidden SSID)'}</Text>
+              <Text style={styles.listMeta}>
+                {record.bssid || '—'} · {record.frequency ? `${record.frequency} MHz` : 'freq —'} · {record.securityLabel}
+              </Text>
+              <Text style={styles.listMeta}>
+                {record.isOpenAuth ? 'OPEN' : 'SECURED'}{record.isLikelyFree ? ' · FREE?' : ''}
+                {record.freeReason ? ` · ${record.freeReason}` : ''}
+              </Text>
             </View>
-          )}
-        />
+            <View style={styles.listSignalBox}>
+              <Text style={styles.listSignalValue}>{formatNumber(record.rssiDbm)} dBm</Text>
+              <Text style={styles.listSignalLabel}>{rssiLabel(record.rssiDbm)}</Text>
+            </View>
+          </View>
+        )) : (
+          <Text style={styles.emptyText}>No nearby Wi‑Fi networks recorded yet.</Text>
+        )}
       </View>
-
-      <View style={styles.panelWrap}>
-        <ScrollView contentContainerStyle={styles.panelContent}>
-          <Text style={styles.title}>Wi-Fi signal map</Text>
-          <Text style={styles.subtitle}>
-            This build uses a WebView-based map so the APK can display the map without mounting the crashing native MapView. GPS logging and CSV export stay unchanged.
-          </Text>
-
-          <View style={styles.buttonRow}>
-            <Pressable
-              style={[styles.button, styles.primaryButton, isTracking || isStarting ? styles.buttonDisabled : null]}
-              onPress={() => {
-                if (!isTracking && !isStarting) {
-                  void startTracking();
-                }
-              }}
-            >
-              {isStarting ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.primaryButtonText}>Start</Text>}
-            </Pressable>
-
-            <Pressable
-              style={[styles.button, styles.secondaryButton, !isTracking ? styles.buttonDisabled : null]}
-              onPress={() => {
-                if (isTracking) stopTracking();
-              }}
-            >
-              <Text style={styles.secondaryButtonText}>Stop</Text>
-            </Pressable>
-
-            <Pressable
-              style={[styles.button, styles.secondaryButton]}
-              onPress={() => {
-                setSamples([]);
-                setRowsWritten(0);
-              }}
-            >
-              <Text style={styles.secondaryButtonText}>Clear map</Text>
-            </Pressable>
-
-            <Pressable
-              style={[styles.button, styles.secondaryButton, !session ? styles.buttonDisabled : null]}
-              onPress={() => {
-                if (session) {
-                  void shareCsv().catch((shareError: unknown) => {
-                    const message = shareError instanceof Error ? shareError.message : 'Failed to export CSV data.';
-                    setError(message);
-                    setStatusText(message);
-                  });
-                }
-              }}
-            >
-              <Text style={styles.secondaryButtonText}>Export CSV</Text>
-            </Pressable>
-          </View>
-
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-          <Text style={styles.status}>{statusText}</Text>
-          {session?.fileUri ? <Text style={styles.filePath}>CSV file: {session.fileUri}</Text> : null}
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Current Wi-Fi</Text>
-            <InfoRow label="SSID" value={currentWifi.ssid ?? 'not connected'} />
-            <InfoRow label="BSSID" value={currentWifi.bssid ?? '—'} mono />
-            <InfoRow label="Strength" value={currentWifi.strength == null ? '—' : `${currentWifi.strength}/100 (${strengthLabel(currentWifi.strength)})`} />
-            <InfoRow label="Frequency" value={currentWifi.frequency == null ? '—' : `${currentWifi.frequency} MHz`} />
-            <InfoRow label="Link speed" value={currentWifi.linkSpeed == null ? '—' : `${currentWifi.linkSpeed} Mbps`} />
-            <InfoRow label="Connected" value={currentWifi.isConnected ? 'yes' : 'no'} />
-            <InfoRow label="Internet" value={currentWifi.isInternetReachable == null ? 'unknown' : currentWifi.isInternetReachable ? 'reachable' : 'offline'} />
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Current position</Text>
-            <InfoRow label="Latitude" value={currentLocation ? currentLocation.latitude.toFixed(6) : '—'} mono />
-            <InfoRow label="Longitude" value={currentLocation ? currentLocation.longitude.toFixed(6) : '—'} mono />
-            <InfoRow label="Accuracy" value={currentLocation ? `${formatNumber(toNullableNumber(currentLocation.accuracy), 1)} m` : '—'} />
-            <InfoRow label="Speed" value={currentLocation ? `${formatNumber(toNullableNumber(currentLocation.speed), 1)} m/s` : '—'} />
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Session</Text>
-            <InfoRow label="Tracking" value={isTracking ? 'running' : 'stopped'} />
-            <InfoRow label="Map engine" value="WebView + Leaflet" />
-            <InfoRow label="Rows written" value={String(rowsWritten)} />
-            <InfoRow label="Points in memory" value={String(samples.length)} />
-            <InfoRow label="Last update" value={currentSample ? currentSample.capturedAt.replace('T', ' ').replace('Z', ' UTC') : '—'} mono />
-          </View>
-
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>Signal legend</Text>
-            <SignalLegend />
-          </View>
-
-          <Text style={styles.note}>
-            Limitation: this Expo-compatible build still tracks only the currently connected Wi-Fi network. The web map needs network access to load the Leaflet script and map tiles.
-          </Text>
-        </ScrollView>
-      </View>
-    </View>
-  );
-}
-
-function InfoRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <View style={styles.infoRow}>
-      <Text style={styles.infoLabel}>{label}</Text>
-      <Text style={[styles.infoValue, mono ? styles.mono : null]}>{value}</Text>
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  mapWrap: {
-    flex: 1.05,
-    minHeight: 320,
-    backgroundColor: '#dbeafe',
-  },
-  map: {
-    width: '100%',
-    height: '100%',
-    backgroundColor: '#dbeafe',
-  },
-  mapLoading: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 10,
-    backgroundColor: '#dbeafe',
-  },
-  mapLoadingText: {
-    color: '#334155',
-    fontSize: 13,
-  },
-  panelWrap: {
-    flex: 0.95,
+  content: {
     backgroundColor: '#f8fafc',
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
-    marginTop: -16,
-    overflow: 'hidden',
-  },
-  panelContent: {
+    gap: 16,
     padding: 16,
-    gap: 12,
+    paddingBottom: 28,
+  },
+  headerBlock: {
+    gap: 6,
+    marginTop: 8,
   },
   title: {
-    fontSize: 22,
-    fontWeight: '800',
     color: '#0f172a',
+    fontSize: 28,
+    fontWeight: '700',
   },
   subtitle: {
-    fontSize: 13,
-    lineHeight: 19,
     color: '#475569',
-  },
-  buttonRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  button: {
-    minWidth: 88,
-    borderRadius: 999,
-    paddingVertical: 11,
-    paddingHorizontal: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  primaryButton: {
-    backgroundColor: '#2563eb',
-  },
-  secondaryButton: {
-    backgroundColor: '#e2e8f0',
-  },
-  buttonDisabled: {
-    opacity: 0.45,
-  },
-  primaryButtonText: {
-    color: '#ffffff',
     fontSize: 14,
-    fontWeight: '700',
+    lineHeight: 20,
   },
-  secondaryButtonText: {
-    color: '#0f172a',
-    fontSize: 14,
-    fontWeight: '700',
+  mapCard: {
+    backgroundColor: 'white',
+    borderColor: '#e2e8f0',
+    borderRadius: 18,
+    borderWidth: 1,
+    overflow: 'hidden',
   },
-  error: {
-    color: '#b91c1c',
+  mapWrap: {
+    height: 360,
+  },
+  map: {
+    flex: 1,
+  },
+  legendWrap: {
+    borderTopColor: '#e2e8f0',
+    borderTopWidth: 1,
+    padding: 14,
+  },
+  panelCard: {
+    backgroundColor: 'white',
+    borderColor: '#e2e8f0',
+    borderRadius: 18,
+    borderWidth: 1,
+    gap: 12,
+    padding: 16,
+  },
+  metaGrid: {
+    gap: 6,
+  },
+  metaLine: {
+    color: '#334155',
     fontSize: 13,
   },
   status: {
     color: '#0f172a',
-    fontSize: 13,
-    fontWeight: '600',
+    fontSize: 14,
+    lineHeight: 20,
   },
-  filePath: {
-    color: '#475569',
-    fontSize: 12,
-  },
-  card: {
-    backgroundColor: '#ffffff',
-    borderRadius: 16,
-    padding: 14,
-    gap: 10,
-    shadowColor: '#0f172a',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
-  },
-  cardTitle: {
-    fontSize: 15,
-    fontWeight: '800',
-    color: '#0f172a',
-  },
-  infoRow: {
+  loadingRow: {
+    alignItems: 'center',
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 16,
+    gap: 10,
   },
-  infoLabel: {
+  loadingText: {
     color: '#475569',
     fontSize: 13,
   },
-  infoValue: {
+  buttonRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  button: {
+    borderRadius: 12,
+    minHeight: 42,
+    minWidth: 110,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  primaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#2563eb',
+    justifyContent: 'center',
+  },
+  primaryButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  secondaryButton: {
+    alignItems: 'center',
+    backgroundColor: '#e2e8f0',
+    justifyContent: 'center',
+  },
+  secondaryButtonText: {
+    color: '#0f172a',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  disabledButton: {
+    opacity: 0.55,
+  },
+  listCard: {
+    backgroundColor: 'white',
+    borderColor: '#e2e8f0',
+    borderRadius: 18,
+    borderWidth: 1,
+    gap: 10,
+    padding: 16,
+  },
+  sectionTitle: {
+    color: '#0f172a',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  listRow: {
+    alignItems: 'center',
+    borderBottomColor: '#e2e8f0',
+    borderBottomWidth: 1,
+    flexDirection: 'row',
+    gap: 12,
+    paddingVertical: 10,
+  },
+  listMain: {
+    flex: 1,
+    gap: 2,
+  },
+  listSsid: {
+    color: '#0f172a',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  listMeta: {
+    color: '#64748b',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  listSignalBox: {
+    alignItems: 'flex-end',
+    minWidth: 78,
+  },
+  listSignalValue: {
     color: '#0f172a',
     fontSize: 13,
-    fontWeight: '600',
-    flexShrink: 1,
-    textAlign: 'right',
+    fontWeight: '700',
   },
-  mono: {
-    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
-  },
-  note: {
+  listSignalLabel: {
     color: '#475569',
     fontSize: 12,
-    lineHeight: 18,
+  },
+  emptyText: {
+    color: '#64748b',
+    fontSize: 13,
   },
 });

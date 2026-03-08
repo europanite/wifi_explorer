@@ -12,8 +12,7 @@
     "eas:whoami": "npx eas-cli@latest whoami",
     "build:apk": "npx eas-cli@latest build --platform android --profile preview",
     "build:apk:docker": "sh ./scripts/build-apk.sh",
-    "android": "expo run:android",
-    "ios": "expo run:ios"
+    "android": "expo run:android"
   },
   "dependencies": {
     "@react-native-community/netinfo": "11.5.2",
@@ -24,9 +23,9 @@
     "expo-status-bar": "~3.0.0",
     "react": "19.1.0",
     "react-native": "0.81.0",
-    "react-native-maps": "1.20.1",
     "react-native-safe-area-context": "5.4.0",
-    "react-native-webview": "13.15.0"
+    "react-native-webview": "13.15.0",
+    "react-native-wifi-reborn": "4.13.6"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",
