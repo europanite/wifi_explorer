@@ -1,0 +1,27 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: wifi_gps_logger_frontend
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./frontend/app:/app
+      - /app/node_modules
+    environment:
+      REACT_NATIVE_PACKAGER_HOSTNAME: ${REACT_NATIVE_PACKAGER_HOSTNAME}
+      EXPO_DEVTOOLS_LISTEN_ADDRESS: ${EXPO_DEVTOOLS_LISTEN_ADDRESS:-0.0.0.0}
+      EXPO_TUNNEL: ${EXPO_TUNNEL:-false}
+      EXPO_TOKEN: ${EXPO_TOKEN:-}
+      GIT_USER_NAME: ${GIT_USER_NAME:-europanite}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-europanite@example.com}
+    ports:
+      - "8081:8081"
+      - "19000:19000"
+      - "19001:19001"
+      - "19002:19002"
+    command: >-
+      sh -lc "npm install && npx expo start --host lan --clear"
+    restart: unless-stopped

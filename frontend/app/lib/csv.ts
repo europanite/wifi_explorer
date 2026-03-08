@@ -76,14 +76,24 @@ function recordToCsvRow(record: WifiAccessPointRecord): string {
   ].map(escapeCsvCell).join(',');
 }
 
+async function appendText(fileUri: string, text: string): Promise<void> {
+  const info = await FileSystem.getInfoAsync(fileUri);
+  const existing = info.exists
+    ? await FileSystem.readAsStringAsync(fileUri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      })
+    : '';
+
+  await FileSystem.writeAsStringAsync(fileUri, `${existing}${text}`, {
+    encoding: FileSystem.EncodingType.UTF8,
+  });
+}
+
 export async function appendRecords(fileUri: string, records: WifiAccessPointRecord[]): Promise<void> {
   if (!records.length) {
     return;
   }
 
   const body = records.map((record) => recordToCsvRow(record)).join('\n');
-  await FileSystem.writeAsStringAsync(fileUri, `${body}\n`, {
-    append: true,
-    encoding: FileSystem.EncodingType.UTF8,
-  });
+  await appendText(fileUri, `${body}\n`);
 }
