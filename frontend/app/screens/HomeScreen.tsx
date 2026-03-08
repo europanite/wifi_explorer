@@ -25,7 +25,8 @@ const DEFAULT_CENTER = {
   longitude: 139.767125,
 };
 
-const SCAN_INTERVAL_MS = 30000;
+const SCAN_INTERVAL_MS = 10000;
+const CSV_FLUSH_INTERVAL_MS = 60000;
 const MAX_VISIBLE_POINTS = 300;
 const MAX_LIST_ITEMS = 40;
 
@@ -90,6 +91,22 @@ function formatNumber(value: number | null, digits = 0): string {
 function permissionLabel(value: PermissionState): string {
   if (value === 'blocked') return 'blocked';
   return value;
+}
+
+function strongestRssiValue(value: number | null): number {
+  return value == null ? -999 : value;
+}
+
+function surveyKey(record: Pick<WifiAccessPointRecord, 'ssid' | 'bssid' | 'frequency'>): string {
+  const normalizedSsid = (record.ssid ?? '').trim().toLowerCase();
+  if (normalizedSsid) {
+    return `ssid:${normalizedSsid}`;
+  }
+  const normalizedBssid = (record.bssid ?? '').trim().toLowerCase();
+  if (normalizedBssid) {
+    return `bssid:${normalizedBssid}`;
+  }
+  return `hidden:${record.frequency ?? 'na'}`;
 }
 
 function makeLeafletHtml(): string {
@@ -270,15 +287,18 @@ export default function HomeScreen() {
   const webViewRef = useRef<WebView | null>(null);
   const locationSubRef = useRef<Location.LocationSubscription | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const csvFlushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sessionRef = useRef<SessionInfo | null>(null);
   const latestLocationRef = useRef<Location.LocationObject | null>(null);
   const mapReadyRef = useRef(false);
-  const samplesByBssidRef = useRef<Map<string, WifiAccessPointRecord>>(new Map());
+  const strongestFreeSamplesRef = useRef<Map<string, WifiAccessPointRecord>>(new Map());
+  const pendingCsvRecordsRef = useRef<WifiAccessPointRecord[]>([]);
 
   const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(null);
   const [statusText, setStatusText] = useState('Preparing Wi-Fi survey session…');
   const [isBusy, setIsBusy] = useState(true);
   const [isScanning, setIsScanning] = useState(false);
+  const [isSurveyRunning, setIsSurveyRunning] = useState(false);
   const [locationPermission, setLocationPermission] = useState<PermissionState>('pending');
   const [wifiPermission, setWifiPermission] = useState<PermissionState>('pending');
   const [locationServicesOn, setLocationServicesOn] = useState<boolean | null>(null);
@@ -323,8 +343,8 @@ export default function HomeScreen() {
   }, []);
 
   const refreshVisibleSamples = useCallback((currentLocation: Location.LocationObject | null, currentRoute: Coordinate[] = route) => {
-    const records = Array.from(samplesByBssidRef.current.values())
-      .sort((a, b) => (b.rssiDbm ?? -999) - (a.rssiDbm ?? -999))
+    const records = Array.from(strongestFreeSamplesRef.current.values())
+      .sort((a, b) => strongestRssiValue(b.rssiDbm) - strongestRssiValue(a.rssiDbm))
       .slice(0, MAX_VISIBLE_POINTS);
     setVisibleSamples(records);
     sendPayloadToMap(records, currentLocation, currentRoute);
@@ -399,6 +419,18 @@ export default function HomeScreen() {
     );
   }, [sendPayloadToMap, visibleSamples]);
 
+  const flushPendingCsv = useCallback(async () => {
+    const session = sessionRef.current;
+    const records = pendingCsvRecordsRef.current;
+
+    if (!session || !records.length) {
+      return;
+    }
+
+    pendingCsvRecordsRef.current = [];
+    await appendRecords(session.fileUri, records);
+  }, []);
+
   const runWifiScan = useCallback(async (forceRescan: boolean) => {
     if (isScanning) {
       return;
@@ -447,20 +479,28 @@ export default function HomeScreen() {
         };
       });
 
-      await appendRecords(session.fileUri, records);
+      pendingCsvRecordsRef.current.push(...records);
 
-      const latestByBssid = samplesByBssidRef.current;
+      const strongestFreeByKey = strongestFreeSamplesRef.current;
       for (const record of records) {
-        const key = record.bssid ?? `${record.ssid ?? 'hidden'}:${record.frequency ?? 'na'}`;
-        latestByBssid.set(key, record);
+        if (!record.isLikelyFree) {
+          continue;
+        }
+
+        const key = surveyKey(record);
+        const current = strongestFreeByKey.get(key);
+        if (!current || strongestRssiValue(record.rssiDbm) > strongestRssiValue(current.rssiDbm)) {
+          strongestFreeByKey.set(key, record);
+        }
       }
 
-      const strongestFirst = [...records].sort((a, b) => (b.rssiDbm ?? -999) - (a.rssiDbm ?? -999));
+      const strongestFirst = [...records].sort((a, b) => strongestRssiValue(b.rssiDbm) - strongestRssiValue(a.rssiDbm));
       setLatestScan(strongestFirst.slice(0, MAX_LIST_ITEMS));
 
       const openCount = records.filter((record) => record.isOpenAuth).length;
       const freeCount = records.filter((record) => record.isLikelyFree).length;
-      setStatusText(`Scan saved: ${records.length} networks (${openCount} open, ${freeCount} free-flagged).`);
+      const pendingCount = pendingCsvRecordsRef.current.length;
+      setStatusText(`Survey running: ${records.length} networks in the latest scan (${openCount} open, ${freeCount} free-flagged). Pending CSV rows: ${pendingCount}.`);
       refreshVisibleSamples(location);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -477,6 +517,8 @@ export default function HomeScreen() {
       return;
     }
 
+    await flushPendingCsv();
+
     const available = await Sharing.isAvailableAsync();
     if (!available) {
       Alert.alert('Sharing unavailable', 'This device cannot share files from the app.');
@@ -488,7 +530,65 @@ export default function HomeScreen() {
       mimeType: 'text/csv',
       UTI: 'public.comma-separated-values-text',
     });
-  }, []);
+  }, [flushPendingCsv]);
+
+  const startSurvey = useCallback(async () => {
+    if (isSurveyRunning || isScanning) {
+      return;
+    }
+
+    if (locationPermission !== 'granted') {
+      setStatusText('Location permission is required before starting the survey.');
+      return;
+    }
+
+    if (wifiPermission !== 'granted') {
+      setStatusText('Wi-Fi permission is required before starting the survey.');
+      return;
+    }
+
+    const location = latestLocationRef.current;
+    if (!location) {
+      setStatusText('Waiting for a GPS fix before starting the continuous survey.');
+      return;
+    }
+
+    setIsSurveyRunning(true);
+    setStatusText('Starting continuous Wi-Fi survey…');
+
+    await runWifiScan(true);
+
+    if (scanTimerRef.current) {
+      clearInterval(scanTimerRef.current);
+    }
+    scanTimerRef.current = setInterval(() => {
+      runWifiScan(false).catch(() => undefined);
+    }, SCAN_INTERVAL_MS);
+
+    if (csvFlushTimerRef.current) {
+      clearInterval(csvFlushTimerRef.current);
+    }
+    csvFlushTimerRef.current = setInterval(() => {
+      flushPendingCsv().catch(() => undefined);
+    }, CSV_FLUSH_INTERVAL_MS);
+
+    setStatusText('Survey is running. Walk around and the app will keep scanning every 10 seconds. CSV rows are flushed every minute.');
+  }, [flushPendingCsv, isScanning, isSurveyRunning, locationPermission, runWifiScan, wifiPermission]);
+
+  const stopSurvey = useCallback(async () => {
+    if (scanTimerRef.current) {
+      clearInterval(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
+    if (csvFlushTimerRef.current) {
+      clearInterval(csvFlushTimerRef.current);
+      csvFlushTimerRef.current = null;
+    }
+
+    setIsSurveyRunning(false);
+    await flushPendingCsv();
+    setStatusText('Survey stopped. The strongest free SSIDs remain on the map, and pending CSV rows were flushed.');
+  }, [flushPendingCsv]);
 
   useEffect(() => {
     let mounted = true;
@@ -527,11 +627,7 @@ export default function HomeScreen() {
         await startLocationTracking();
         if (!mounted) return;
 
-        setStatusText('Ready. APK build scans every 30 seconds and saves all visible networks.');
-        runWifiScan(true).catch(() => undefined);
-        scanTimerRef.current = setInterval(() => {
-          runWifiScan(false).catch(() => undefined);
-        }, SCAN_INTERVAL_MS);
+        setStatusText('Ready. Press Start survey, then walk around to keep scanning nearby Wi-Fi continuously.');
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (mounted) {
@@ -552,12 +648,17 @@ export default function HomeScreen() {
         clearInterval(scanTimerRef.current);
         scanTimerRef.current = null;
       }
+      if (csvFlushTimerRef.current) {
+        clearInterval(csvFlushTimerRef.current);
+        csvFlushTimerRef.current = null;
+      }
+      flushPendingCsv().catch(() => undefined);
       if (locationSubRef.current) {
         locationSubRef.current.remove();
         locationSubRef.current = null;
       }
     };
-  }, [ensureSession, runWifiScan, startLocationTracking]);
+  }, [ensureSession, flushPendingCsv, startLocationTracking]);
 
   useEffect(() => {
     sendPayloadToMap(visibleSamples, lastLocation, route);
@@ -570,15 +671,16 @@ export default function HomeScreen() {
       total: latestScan.length,
       openCount,
       freeCount,
+      mappedFreeCount: visibleSamples.length,
     };
-  }, [latestScan]);
+  }, [latestScan, visibleSamples]);
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <View style={styles.headerBlock}>
         <Text style={styles.title}>Nearby Wi‑Fi Survey</Text>
         <Text style={styles.subtitle}>
-          Android APK mode: scan every visible SSID/BSSID, save all rows to CSV, and flag open or likely free hotspots.
+          Press Start survey, then keep walking. The app scans continuously, shows only free-flagged SSIDs on the map, keeps the strongest signal per SSID, and flushes CSV rows every minute.
         </Text>
       </View>
 
@@ -610,9 +712,11 @@ export default function HomeScreen() {
           <Text style={styles.metaLine}>
             Last GPS: {lastLocation ? `${lastLocation.coords.latitude.toFixed(5)}, ${lastLocation.coords.longitude.toFixed(5)}` : 'waiting…'}
           </Text>
-          <Text style={styles.metaLine}>Visible list: {summary.total} items</Text>
+          <Text style={styles.metaLine}>Latest scan list: {summary.total} items</Text>
           <Text style={styles.metaLine}>Open auth: {summary.openCount}</Text>
           <Text style={styles.metaLine}>Free-flagged: {summary.freeCount}</Text>
+          <Text style={styles.metaLine}>Mapped free SSIDs: {summary.mappedFreeCount}</Text>
+          <Text style={styles.metaLine}>Survey state: {isSurveyRunning ? 'running' : 'stopped'}</Text>
         </View>
 
         <Text style={styles.status}>{statusText}</Text>
@@ -628,11 +732,21 @@ export default function HomeScreen() {
           <Pressable
             style={[styles.button, styles.primaryButton, isScanning ? styles.disabledButton : null]}
             onPress={() => {
-              runWifiScan(true).catch(() => undefined);
+              if (isSurveyRunning) {
+                stopSurvey().catch((error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  Alert.alert('Stop survey failed', message);
+                });
+              } else {
+                startSurvey().catch((error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  Alert.alert('Start survey failed', message);
+                });
+              }
             }}
             disabled={isScanning}
           >
-            <Text style={styles.primaryButtonText}>{isScanning ? 'Scanning…' : 'Scan now'}</Text>
+            <Text style={styles.primaryButtonText}>{isScanning ? 'Scanning…' : isSurveyRunning ? 'Stop survey' : 'Start survey'}</Text>
           </Pressable>
 
           <Pressable style={[styles.button, styles.secondaryButton]} onPress={() => {
@@ -653,7 +767,7 @@ export default function HomeScreen() {
       </View>
 
       <View style={styles.listCard}>
-        <Text style={styles.sectionTitle}>Latest scan results</Text>
+        <Text style={styles.sectionTitle}>Latest scan snapshot</Text>
         {latestScan.length ? latestScan.map((record) => (
           <View key={record.id} style={styles.listRow}>
             <View style={styles.listMain}>
